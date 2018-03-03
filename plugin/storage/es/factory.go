@@ -27,7 +27,10 @@ import (
 	esSpanStore "github.com/jaegertracing/jaeger/plugin/storage/es/spanstore"
 	"github.com/jaegertracing/jaeger/storage/dependencystore"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
+	"github.com/Shopify/sarama"
 )
+
+var kafkaBrokers = []string {"localhost:9092"}
 
 // Factory implements storage.Factory for Elasticsearch backend.
 type Factory struct {
@@ -38,12 +41,16 @@ type Factory struct {
 
 	primaryConfig config.ClientBuilder
 	primaryClient es.Client
+
+	kafkaConfig	   *sarama.Config
+	kafkaProducer  sarama.SyncProducer
 }
 
 // NewFactory creates a new Factory.
 func NewFactory() *Factory {
 	return &Factory{
 		Options: NewOptions("es"), // TODO add "es-archive" once supported
+		kafkaConfig: sarama.NewConfig(),
 	}
 }
 
@@ -68,6 +75,23 @@ func (f *Factory) Initialize(metricsFactory metrics.Factory, logger *zap.Logger)
 	}
 	f.primaryClient = primaryClient
 	// TODO init archive (cf. https://github.com/jaegertracing/jaeger/pull/604)
+
+	// karma configuration
+	f.kafkaConfig.Producer.RequiredAcks = sarama.WaitForAll
+	f.kafkaConfig.Producer.Retry.Max = 5
+	f.kafkaConfig.Producer.Return.Successes = true
+	producer, err := sarama.NewSyncProducer(kafkaBrokers, f.kafkaConfig)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := producer.Close(); err != nil {
+			panic(err)
+		}
+	}()
+
+	f.kafkaProducer = producer
+
 	return nil
 }
 
@@ -80,7 +104,7 @@ func (f *Factory) CreateSpanReader() (spanstore.Reader, error) {
 // CreateSpanWriter implements storage.Factory
 func (f *Factory) CreateSpanWriter() (spanstore.Writer, error) {
 	cfg := f.primaryConfig
-	return esSpanStore.NewSpanWriter(f.primaryClient, f.logger, f.metricsFactory, cfg.GetNumShards(), cfg.GetNumReplicas()), nil
+	return esSpanStore.NewSpanWriter(f.kafkaProducer, f.primaryClient, f.logger, f.metricsFactory, cfg.GetNumShards(), cfg.GetNumReplicas()), nil
 }
 
 // CreateDependencyReader implements storage.Factory

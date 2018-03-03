@@ -31,11 +31,14 @@ import (
 	"github.com/jaegertracing/jaeger/pkg/cache"
 	"github.com/jaegertracing/jaeger/pkg/es"
 	storageMetrics "github.com/jaegertracing/jaeger/storage/spanstore/metrics"
+	"github.com/Shopify/sarama"
+	jsonConverter "encoding/json"
 )
 
 const (
 	spanType    = "span"
 	serviceType = "service"
+	topic = "traces"
 
 	defaultNumShards   = 5
 	defaultNumReplicas = 1
@@ -49,6 +52,7 @@ type serviceWriter func(string, *jModel.Span)
 
 // SpanWriter is a wrapper around elastic.Client
 type SpanWriter struct {
+	kafkaProducer sarama.SyncProducer
 	ctx           context.Context
 	client        es.Client
 	logger        *zap.Logger
@@ -76,6 +80,7 @@ type Span struct {
 
 // NewSpanWriter creates a new SpanWriter for use
 func NewSpanWriter(
+	kafkaProducer sarama.SyncProducer,
 	client es.Client,
 	logger *zap.Logger,
 	metricsFactory metrics.Factory,
@@ -92,6 +97,7 @@ func NewSpanWriter(
 	// TODO: Configurable TTL
 	serviceOperationStorage := NewServiceOperationStorage(ctx, client, metricsFactory, logger, time.Hour*12)
 	return &SpanWriter{
+		kafkaProducer: kafkaProducer,
 		ctx:    ctx,
 		client: client,
 		logger: logger,
@@ -180,6 +186,24 @@ func (s *SpanWriter) writeSpan(indexName string, jsonSpan *jModel.Span) {
 	elasticSpan := Span{Span: jsonSpan, StartTimeMillis: jsonSpan.StartTime / 1000} // Microseconds to milliseconds
 
 	s.client.Index().Index(indexName).Type(spanType).BodyJson(&elasticSpan).Add()
+
+	jsonBytes, err := jsonConverter.Marshal(elasticSpan)
+	if err != nil {
+		panic(err)
+	}
+
+	msg := &sarama.ProducerMessage{
+		Topic: topic,
+		Value: sarama.StringEncoder(string(jsonBytes)),
+	}
+	partition, offset, err := s.kafkaProducer.SendMessage(msg)
+	if err != nil {
+		panic(err)
+	}
+	s.logger.With(zap.String("Topic", string(topic))).
+		With(zap.String("Partition", string(partition))).
+		With(zap.String("Offset", string(offset))).
+		Info("Message stored in zafka")
 }
 
 func (s *SpanWriter) logError(span *jModel.Span, err error, msg string, logger *zap.Logger) error {
