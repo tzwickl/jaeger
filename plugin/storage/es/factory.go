@@ -28,6 +28,8 @@ import (
 	"github.com/jaegertracing/jaeger/storage/dependencystore"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 	"github.com/Shopify/sarama"
+	"os"
+	"os/signal"
 )
 
 var kafkaBrokers = []string {"localhost:9092"}
@@ -42,15 +44,13 @@ type Factory struct {
 	primaryConfig config.ClientBuilder
 	primaryClient es.Client
 
-	kafkaConfig	   *sarama.Config
-	kafkaProducer  sarama.SyncProducer
+	kafkaProducer  sarama.AsyncProducer
 }
 
 // NewFactory creates a new Factory.
 func NewFactory() *Factory {
 	return &Factory{
 		Options: NewOptions("es"), // TODO add "es-archive" once supported
-		kafkaConfig: sarama.NewConfig(),
 	}
 }
 
@@ -76,23 +76,41 @@ func (f *Factory) Initialize(metricsFactory metrics.Factory, logger *zap.Logger)
 	f.primaryClient = primaryClient
 	// TODO init archive (cf. https://github.com/jaegertracing/jaeger/pull/604)
 
-	// karma configuration
-	f.kafkaConfig.Producer.RequiredAcks = sarama.WaitForAll
-	f.kafkaConfig.Producer.Retry.Max = 5
-	f.kafkaConfig.Producer.Return.Successes = true
-	producer, err := sarama.NewSyncProducer(kafkaBrokers, f.kafkaConfig)
+	f.kafkaProducer, err = createKafkaProducer(kafkaBrokers, f)
+
 	if err != nil {
 		panic(err)
 	}
-	defer func() {
+
+	return nil
+}
+
+func createKafkaProducer (kafkaConn []string, f *Factory) (sarama.AsyncProducer, error) {
+	config := sarama.NewConfig()
+	config.Producer.RequiredAcks = sarama.WaitForLocal
+	config.Producer.Compression = sarama.CompressionNone
+	var err error
+	producer, err := sarama.NewAsyncProducer(kafkaConn, config)
+	if err != nil {
+		return nil, err
+	}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Kill)
+	go func() {
+		<-c
 		if err := producer.Close(); err != nil {
-			panic(err)
+			f.logger.Fatal("Error closing async producer", zap.String("Error", err.Error()))
+		}
+		f.logger.Info("Async Producer closed")
+	}()
+	go func() {
+		for err := range producer.Errors() {
+			f.logger.Fatal("Failed to write message to topic:", zap.String("Error", err.Err.Error()))
 		}
 	}()
 
-	f.kafkaProducer = producer
-
-	return nil
+	return producer, nil
 }
 
 // CreateSpanReader implements storage.Factory
